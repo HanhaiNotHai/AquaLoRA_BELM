@@ -21,6 +21,8 @@ from diffusers.pipelines.stable_diffusion.pipeline_stable_diffusion import (
 )
 from diffusers.utils.deprecation_utils import deprecate
 from diffusers.utils.doc_utils import replace_example_docstring
+from PIL import Image
+from torchvision import transforms
 
 from utils.lora_modules import (
     CustomLoRACompatibleConvforward,
@@ -45,7 +47,7 @@ class CustomStableDiffusionPipeline(StableDiffusionPipeline):
         xis: list[torch.FloatTensor],
         intermediate: torch.FloatTensor,
         intermediate_second: Optional[torch.FloatTensor] = None,
-    ):
+    ) -> torch.FloatTensor:
         if i < num_inference_steps - 1:
             alpha_s = self.scheduler.alphas_cumprod[timesteps[i + 1]].to(torch.float32)
             alpha_t = self.scheduler.alphas_cumprod[t].to(torch.float32)
@@ -405,6 +407,265 @@ class CustomStableDiffusionPipeline(StableDiffusionPipeline):
 
         return StableDiffusionPipelineOutput(images=image, nsfw_content_detected=has_nsfw_concept)
 
+    def step_inverse(
+        self,
+        noise_pred: torch.FloatTensor,
+        num_inference_steps: int,
+        timesteps: torch.LongTensor,
+        index: int,
+        i: int,
+        xis: list[torch.FloatTensor],
+        latent: torch.FloatTensor,
+    ) -> torch.FloatTensor:
+        if index < num_inference_steps - 1:
+            alpha_i = self.scheduler.alphas_cumprod[timesteps[index]].to(torch.float32)
+            alpha_i_minus_1 = self.scheduler.alphas_cumprod[timesteps[index + 1]].to(torch.float32)
+        else:
+            alpha_i = self.scheduler.alphas_cumprod[timesteps[index]].to(torch.float32)
+            alpha_i_minus_1 = 1
+
+        sigma_i = (1 - alpha_i) ** 0.5
+        sigma_i_minus_1 = (1 - alpha_i_minus_1) ** 0.5
+        alpha_i = alpha_i**0.5
+        alpha_i_minus_1 = alpha_i_minus_1**0.5
+
+        if i == 0:
+            latent = (alpha_i / alpha_i_minus_1) * latent + (
+                sigma_i - (alpha_i / alpha_i_minus_1) * sigma_i_minus_1
+            ) * noise_pred
+        else:
+            alpha_i_minus_2 = (
+                1
+                if i == 1
+                else self.scheduler.alphas_cumprod[timesteps[index + 2]].to(torch.float32)
+            )
+            sigma_i_minus_2 = (1 - alpha_i_minus_2) ** 0.5
+            alpha_i_minus_2 = alpha_i_minus_2**0.5
+
+            h_i = sigma_i / alpha_i - sigma_i_minus_1 / alpha_i_minus_1
+            h_i_minus_1 = sigma_i_minus_1 / alpha_i_minus_1 - sigma_i_minus_2 / alpha_i_minus_2
+
+            coef_x_i_minus_2 = (alpha_i / alpha_i_minus_2) * (h_i**2) / (h_i_minus_1**2)
+            coef_x_i_minus_1 = (
+                (alpha_i / alpha_i_minus_1) * (h_i_minus_1**2 - h_i**2) / (h_i_minus_1**2)
+            )
+            coef_eps = alpha_i * (h_i_minus_1 + h_i) * h_i / h_i_minus_1
+            latent = (
+                coef_x_i_minus_2 * xis[-2] + coef_x_i_minus_1 * xis[-1] + coef_eps * noise_pred
+            )
+        xis.append(latent)
+        return latent
+
+    @torch.no_grad()
+    def inverse(
+        self,
+        prompt: Union[str, List[str]] = None,
+        height: Optional[int] = None,
+        width: Optional[int] = None,
+        num_inference_steps: int = 50,
+        timesteps: List[int] = None,
+        guidance_scale: float = 7.5,
+        negative_prompt: Optional[Union[str, List[str]]] = None,
+        num_images_per_prompt: Optional[int] = 1,
+        eta: float = 0.0,
+        generator: Optional[Union[torch.Generator, List[torch.Generator]]] = None,
+        latents: Optional[torch.FloatTensor] = None,
+        prompt_embeds: Optional[torch.FloatTensor] = None,
+        negative_prompt_embeds: Optional[torch.FloatTensor] = None,
+        ip_adapter_image: Optional[PipelineImageInput] = None,
+        output_type: Optional[str] = "pil",
+        return_dict: bool = True,
+        cross_attention_kwargs: Optional[Dict[str, Any]] = None,
+        guidance_rescale: float = 0.0,
+        clip_skip: Optional[int] = None,
+        callback_on_step_end: Optional[Callable[[int, int, Dict], None]] = None,
+        callback_on_step_end_tensor_inputs: List[str] = ["latents"],
+        **kwargs,
+    ) -> tuple[torch.FloatTensor, torch.FloatTensor]:
+
+        callback = kwargs.pop("callback", None)
+        callback_steps = kwargs.pop("callback_steps", None)
+
+        if callback is not None:
+            deprecate(
+                "callback",
+                "1.0.0",
+                "Passing `callback` as an input argument to `__call__` is deprecated, consider using `callback_on_step_end`",
+            )
+        if callback_steps is not None:
+            deprecate(
+                "callback_steps",
+                "1.0.0",
+                "Passing `callback_steps` as an input argument to `__call__` is deprecated, consider using `callback_on_step_end`",
+            )
+
+        # 0. Default height and width to unet
+        height = height or self.unet.config.sample_size * self.vae_scale_factor
+        width = width or self.unet.config.sample_size * self.vae_scale_factor
+        # to deal with lora scaling and other possible forward hooks
+
+        # 1. Check inputs. Raise error if not correct
+        self.check_inputs(
+            prompt,
+            height,
+            width,
+            callback_steps,
+            negative_prompt,
+            prompt_embeds,
+            negative_prompt_embeds,
+            callback_on_step_end_tensor_inputs,
+        )
+
+        self._guidance_scale = guidance_scale
+        self._guidance_rescale = guidance_rescale
+        self._clip_skip = clip_skip
+        self._cross_attention_kwargs = cross_attention_kwargs
+
+        # 2. Define call parameters
+        if prompt is not None and isinstance(prompt, str):
+            batch_size = 1
+        elif prompt is not None and isinstance(prompt, list):
+            batch_size = len(prompt)
+        else:
+            batch_size = prompt_embeds.shape[0]
+
+        device = self._execution_device
+
+        # 3. Encode input prompt
+        lora_scale = (
+            self.cross_attention_kwargs.get("scale", None)
+            if self.cross_attention_kwargs is not None
+            else None
+        )
+
+        prompt_embeds, negative_prompt_embeds = self.encode_prompt(
+            prompt,
+            device,
+            num_images_per_prompt,
+            self.do_classifier_free_guidance,
+            negative_prompt,
+            prompt_embeds=prompt_embeds,
+            negative_prompt_embeds=negative_prompt_embeds,
+            lora_scale=lora_scale,
+            clip_skip=self.clip_skip,
+        )
+
+        # For classifier free guidance, we need to do two forward passes.
+        # Here we concatenate the unconditional and text embeddings into a single batch
+        # to avoid doing two forward passes
+        if self.do_classifier_free_guidance:
+            prompt_embeds = torch.cat([negative_prompt_embeds, prompt_embeds])
+
+        if ip_adapter_image is not None:
+            image_embeds, negative_image_embeds = self.encode_image(
+                ip_adapter_image, device, num_images_per_prompt
+            )
+            if self.do_classifier_free_guidance:
+                image_embeds = torch.cat([negative_image_embeds, image_embeds])
+
+        # 4. Prepare timesteps
+        timesteps, num_inference_steps = retrieve_timesteps(
+            self.scheduler, num_inference_steps, device, timesteps
+        )
+
+        # 5. Prepare latent variables
+        num_channels_latents = self.unet.config.in_channels
+        latents = self.prepare_latents(
+            batch_size * num_images_per_prompt,
+            num_channels_latents,
+            height,
+            width,
+            prompt_embeds.dtype,
+            device,
+            generator,
+            latents,
+        )
+
+        # 6. Prepare extra step kwargs. TODO: Logic should ideally just be moved out of the pipeline
+        extra_step_kwargs = self.prepare_extra_step_kwargs(generator, eta)
+
+        # 6.1 Add image embeds for IP-Adapter
+        added_cond_kwargs = (
+            {"image_embeds": image_embeds} if ip_adapter_image is not None else None
+        )
+
+        # 6.2 Optionally get Guidance Scale Embedding
+        timestep_cond = None
+        if self.unet.config.time_cond_proj_dim is not None:
+            guidance_scale_tensor = torch.tensor(self.guidance_scale - 1).repeat(
+                batch_size * num_images_per_prompt
+            )
+            timestep_cond = self.get_guidance_scale_embedding(
+                guidance_scale_tensor, embedding_dim=self.unet.config.time_cond_proj_dim
+            ).to(device=device, dtype=latents.dtype)
+
+        # 7. Denoising loop
+        num_warmup_steps = len(timesteps) - num_inference_steps * self.scheduler.order
+        self._num_timesteps = len(timesteps)
+        xis = [latents]
+        with self.progress_bar(total=num_inference_steps) as progress_bar:
+            for i, t in enumerate(timesteps):
+                index = num_inference_steps - i - 1
+                time = timesteps[index + 1] if index < num_inference_steps - 1 else 1
+
+                # expand the latents if we are doing classifier free guidance
+                latent_model_input = (
+                    torch.cat([latents] * 2) if self.do_classifier_free_guidance else latents
+                )
+                latent_model_input = self.scheduler.scale_model_input(latent_model_input, t)
+
+                # predict the noise residual
+                noise_pred = self.unet(
+                    latent_model_input,
+                    time,
+                    encoder_hidden_states=prompt_embeds,
+                    timestep_cond=timestep_cond,
+                    cross_attention_kwargs=self.cross_attention_kwargs,
+                    added_cond_kwargs=added_cond_kwargs,
+                    return_dict=False,
+                )[0]
+
+                # perform guidance
+                if self.do_classifier_free_guidance:
+                    noise_pred_uncond, noise_pred_text = noise_pred.chunk(2)
+                    noise_pred = noise_pred_uncond + self.guidance_scale * (
+                        noise_pred_text - noise_pred_uncond
+                    )
+
+                if self.do_classifier_free_guidance and self.guidance_rescale > 0.0:
+                    # Based on 3.4. in https://arxiv.org/pdf/2305.08891.pdf
+                    noise_pred = rescale_noise_cfg(
+                        noise_pred, noise_pred_text, guidance_rescale=self.guidance_rescale
+                    )
+
+                # compute the previous noisy sample x_t -> x_t-1
+                latents = self.step_inverse(
+                    noise_pred, num_inference_steps, timesteps, index, i, xis, latents
+                )
+
+                if callback_on_step_end is not None:
+                    callback_kwargs = {}
+                    for k in callback_on_step_end_tensor_inputs:
+                        callback_kwargs[k] = locals()[k]
+                    callback_outputs = callback_on_step_end(self, i, t, callback_kwargs)
+
+                    latents = callback_outputs.pop("latents", latents)
+                    prompt_embeds = callback_outputs.pop("prompt_embeds", prompt_embeds)
+                    negative_prompt_embeds = callback_outputs.pop(
+                        "negative_prompt_embeds", negative_prompt_embeds
+                    )
+
+                # call the callback, if provided
+                if i == len(timesteps) - 1 or (
+                    (i + 1) > num_warmup_steps and (i + 1) % self.scheduler.order == 0
+                ):
+                    progress_bar.update()
+                    if callback is not None and i % callback_steps == 0:
+                        step_idx = i // getattr(self.scheduler, "order", 1)
+                        callback(step_idx, t, latents)
+
+        return xis[-1], xis[-2]
+
 
 @torch.inference_mode()
 def main():
@@ -421,7 +682,10 @@ def main():
     lora_weight_name = 'pytorch_lora_weights.safetensors'
     mapper_weight_name = 'mapper.pt'
     msgdecoder_weight_name = 'msgdecoder.pt'
-    prompt_path = 'prompt.txt'
+    image_dir = 'COCO2017test'
+    output_dir = 'output'
+
+    os.makedirs(output_dir, exist_ok=True)
 
     scheduler = DDIMScheduler(
         beta_end=0.012,
@@ -461,10 +725,22 @@ def main():
     msgdecoder.eval()
     msgdecoder.to(device)
 
-    with open(prompt_path, 'r') as f:
-        prompts = f.readlines()
-    prompts = [prompt.strip() for prompt in prompts]
-    prompts = prompts[:bs]
+    transform = transforms.Compose(
+        [
+            transforms.Resize(512),
+            transforms.CenterCrop(512),
+            transforms.ToTensor(),
+            transforms.Normalize(0.5, 0.5),
+        ]
+    )
+    image_names = os.listdir(image_dir)
+    image_names.sort()
+    image_names = image_names[:bs]
+    input_image_paths = [os.path.join(image_dir, image_name) for image_name in image_names]
+    input_images = [Image.open(input_image_path) for input_image_path in input_image_paths]
+    input_images = torch.stack([transform(input_image) for input_image in input_images]).to(device)
+    latents = pipeline.vae.encode(input_images).latent_dist.sample()
+    latents = latents * pipeline.vae.config.scaling_factor
 
     msg = torch.randint(0, 2, (bs, msg_bits)).to(device)
     msg_ = msg.float()
@@ -473,10 +749,20 @@ def main():
     if guidance_scale > 1:
         mapped_loradiag = torch.cat([mapped_loradiag] * 2)
 
-    images = pipeline.forward(
-        prompts,
+    intermediate, second_intermediate = pipeline.inverse(
+        [''] * bs,
         num_inference_steps=num_inference_steps,
         guidance_scale=guidance_scale,
+        latents=latents,
+        cross_attention_kwargs={'scale': mapped_loradiag},
+    )
+
+    images = pipeline.forward(
+        [''] * bs,
+        num_inference_steps=num_inference_steps,
+        guidance_scale=guidance_scale,
+        latents=intermediate,
+        intermediate_second=second_intermediate,
         cross_attention_kwargs={'scale': mapped_loradiag},
     ).images
 
@@ -493,6 +779,9 @@ def main():
     res = msg - decoded_msg
     valid_accuracy = (res == 0).float().mean()
     print(f"validation accuracy: {valid_accuracy.item()}")
+
+    for image, image_name in zip(images, image_names):
+        image.save(os.path.join(output_dir, image_name))
 
 
 if __name__ == "__main__":
