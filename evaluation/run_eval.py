@@ -33,6 +33,62 @@ from utils.models import MapperNet, SecretDecoder
 
 class CustomStableDiffusionPipeline(StableDiffusionPipeline):
 
+    scheduler: DDIMScheduler
+
+    def step_forward(
+        self,
+        noise_pred: torch.FloatTensor,
+        num_inference_steps: int,
+        timesteps: torch.LongTensor,
+        t: int,
+        i: int,
+        xis: list[torch.FloatTensor],
+        intermediate: torch.FloatTensor,
+        intermediate_second: Optional[torch.FloatTensor] = None,
+    ):
+        if i < num_inference_steps - 1:
+            alpha_s = self.scheduler.alphas_cumprod[timesteps[i + 1]].to(torch.float32)
+            alpha_t = self.scheduler.alphas_cumprod[t].to(torch.float32)
+        else:
+            alpha_s = 1
+            alpha_t = self.scheduler.alphas_cumprod[t].to(torch.float32)
+
+        sigma_s = (1 - alpha_s) ** 0.5
+        sigma_t = (1 - alpha_t) ** 0.5
+        alpha_s = alpha_s**0.5
+        alpha_t = alpha_t**0.5
+
+        coef_xt = alpha_s / alpha_t
+        coef_eps = sigma_s - sigma_t * coef_xt
+        if i == 0:
+            if intermediate_second is not None:
+                intermediate = intermediate_second.clone()
+            else:
+                intermediate = coef_xt * intermediate + coef_eps * noise_pred
+        else:
+            # calculate i-1
+            alpha_p = self.scheduler.alphas_cumprod[timesteps[i - 1]].to(torch.float32)
+            sigma_p = (1 - alpha_p) ** 0.5
+            alpha_p = alpha_p**0.5
+
+            # calculate t
+            t_p, t_t, t_s = sigma_p / alpha_p, sigma_t / alpha_t, sigma_s / alpha_s
+
+            # calculate delta
+            delta_1 = t_t - t_p
+            delta_2 = t_s - t_t
+            delta_3 = t_s - t_p
+
+            # calculate coef
+            coef_1 = delta_2 * delta_3 * alpha_s / delta_1
+            coef_2 = (delta_2 / delta_1) ** 2 * (alpha_s / alpha_p)
+            coef_3 = (delta_1 - delta_2) * delta_3 / (delta_1**2) * (alpha_s / alpha_t)
+
+            # iterate
+            intermediate = coef_1 * noise_pred + coef_2 * xis[-2] + coef_3 * xis[-1]
+        xis.append(intermediate)
+        return intermediate
+
     @torch.no_grad()
     @replace_example_docstring(EXAMPLE_DOC_STRING)
     def forward(
@@ -48,6 +104,7 @@ class CustomStableDiffusionPipeline(StableDiffusionPipeline):
         eta: float = 0.0,
         generator: Optional[Union[torch.Generator, List[torch.Generator]]] = None,
         latents: Optional[torch.FloatTensor] = None,
+        intermediate_second: Optional[torch.FloatTensor] = None,
         prompt_embeds: Optional[torch.FloatTensor] = None,
         negative_prompt_embeds: Optional[torch.FloatTensor] = None,
         ip_adapter_image: Optional[PipelineImageInput] = None,
@@ -256,6 +313,7 @@ class CustomStableDiffusionPipeline(StableDiffusionPipeline):
         # 7. Denoising loop
         num_warmup_steps = len(timesteps) - num_inference_steps * self.scheduler.order
         self._num_timesteps = len(timesteps)
+        xis = [latents]
         with self.progress_bar(total=num_inference_steps) as progress_bar:
             for i, t in enumerate(timesteps):
                 # expand the latents if we are doing classifier free guidance
@@ -289,9 +347,16 @@ class CustomStableDiffusionPipeline(StableDiffusionPipeline):
                     )
 
                 # compute the previous noisy sample x_t -> x_t-1
-                latents = self.scheduler.step(
-                    noise_pred, t, latents, **extra_step_kwargs, return_dict=False
-                )[0]
+                latents = self.step_forward(
+                    noise_pred,
+                    num_inference_steps,
+                    timesteps,
+                    t,
+                    i,
+                    xis,
+                    latents,
+                    intermediate_second,
+                )
 
                 if callback_on_step_end is not None:
                     callback_kwargs = {}
