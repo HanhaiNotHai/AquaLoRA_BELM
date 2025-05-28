@@ -1,6 +1,7 @@
 .vscode
 evaluation/COCO2017test
 evaluation/output
+evaluation/input
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
