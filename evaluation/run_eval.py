@@ -11,9 +11,6 @@ import torch
 from diffusers import DDIMScheduler, StableDiffusionPipeline
 from diffusers.image_processor import PipelineImageInput
 from diffusers.models.lora import LoRACompatibleConv, LoRACompatibleLinear
-from diffusers.pipelines.stable_diffusion.pipeline_output import (
-    StableDiffusionPipelineOutput,
-)
 from diffusers.pipelines.stable_diffusion.pipeline_stable_diffusion import (
     EXAMPLE_DOC_STRING,
     rescale_noise_cfg,
@@ -317,6 +314,7 @@ class CustomStableDiffusionPipeline(StableDiffusionPipeline):
         self._num_timesteps = len(timesteps)
         xis = [latents]
         with self.progress_bar(total=num_inference_steps) as progress_bar:
+            progress_bar.set_description('forward')
             for i, t in enumerate(timesteps):
                 # expand the latents if we are doing classifier free guidance
                 latent_model_input = (
@@ -402,10 +400,7 @@ class CustomStableDiffusionPipeline(StableDiffusionPipeline):
         # Offload all models
         self.maybe_free_model_hooks()
 
-        if not return_dict:
-            return (image, has_nsfw_concept)
-
-        return StableDiffusionPipelineOutput(images=image, nsfw_content_detected=has_nsfw_concept)
+        return latents, image
 
     def step_inverse(
         self,
@@ -604,6 +599,7 @@ class CustomStableDiffusionPipeline(StableDiffusionPipeline):
         self._num_timesteps = len(timesteps)
         xis = [latents]
         with self.progress_bar(total=num_inference_steps) as progress_bar:
+            progress_bar.set_description('inverse')
             for i, t in enumerate(timesteps):
                 index = num_inference_steps - i - 1
                 time = timesteps[index + 1] if index < num_inference_steps - 1 else 1
@@ -663,6 +659,9 @@ class CustomStableDiffusionPipeline(StableDiffusionPipeline):
                     if callback is not None and i % callback_steps == 0:
                         step_idx = i // getattr(self.scheduler, "order", 1)
                         callback(step_idx, t, latents)
+
+        # Offload all models
+        self.maybe_free_model_hooks()
 
         return xis[-1], xis[-2]
 
@@ -757,14 +756,14 @@ def main():
         cross_attention_kwargs={'scale': torch.zeros_like(mapped_loradiag)},
     )
 
-    images = pipeline.forward(
+    rec_latents, images = pipeline.forward(
         [''] * bs,
         num_inference_steps=num_inference_steps,
         guidance_scale=guidance_scale,
         latents=intermediate,
         intermediate_second=second_intermediate,
         cross_attention_kwargs={'scale': mapped_loradiag},
-    ).images
+    )
 
     # decode messages
     np_images = np.stack([np.asarray(img) for img in images])
@@ -779,6 +778,11 @@ def main():
     res = msg - decoded_msg
     valid_accuracy = (res == 0).float().mean()
     print(f"validation accuracy: {valid_accuracy.item()}")
+
+    mse_latent = torch.nn.functional.mse_loss(rec_latents, latents)
+    mse_pixel = torch.nn.functional.mse_loss(tensor_images, input_images)
+    print(f'{mse_latent.item() = }')
+    print(f'{mse_pixel.item() = }')
 
     for image, image_name in zip(images, image_names):
         image.save(os.path.join(output_dir, image_name))
