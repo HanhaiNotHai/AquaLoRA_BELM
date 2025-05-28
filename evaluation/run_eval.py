@@ -682,7 +682,7 @@ def main():
     lora_weight_name = 'pytorch_lora_weights.safetensors'
     mapper_weight_name = 'mapper.pt'
     msgdecoder_weight_name = 'msgdecoder.pt'
-    image_dir = 'COCO2017test'
+    image_dir = 'input'
     output_dir = 'output'
 
     os.makedirs(output_dir, exist_ok=True)
@@ -754,7 +754,7 @@ def main():
         num_inference_steps=num_inference_steps,
         guidance_scale=guidance_scale,
         latents=latents,
-        cross_attention_kwargs={'scale': mapped_loradiag},
+        cross_attention_kwargs={'scale': torch.zeros_like(mapped_loradiag)},
     )
 
     images = pipeline.forward(
