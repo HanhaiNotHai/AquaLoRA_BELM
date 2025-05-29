@@ -780,7 +780,7 @@ def main():
     print(f"validation accuracy: {valid_accuracy.item()}")
 
     mse_latent = torch.nn.functional.mse_loss(rec_latents, latents)
-    mse_pixel = torch.nn.functional.mse_loss(tensor_images, input_images)
+    mse_pixel = torch.nn.functional.mse_loss((tensor_images + 1) / 2, (input_images + 1) / 2)
     print(f'{mse_latent.item() = }')
     print(f'{mse_pixel.item() = }')
 
