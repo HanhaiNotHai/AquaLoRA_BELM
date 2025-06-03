@@ -8,7 +8,12 @@ from typing import Any, Callable, Dict, List, Optional, Union
 
 import numpy as np
 import torch
-from diffusers import DDIMScheduler, StableDiffusionPipeline
+from diffusers import (
+    AutoencoderKL,
+    DDIMScheduler,
+    StableDiffusionPipeline,
+    UNet2DConditionModel,
+)
 from diffusers.image_processor import PipelineImageInput
 from diffusers.models.lora import LoRACompatibleConv, LoRACompatibleLinear
 from diffusers.pipelines.stable_diffusion.pipeline_stable_diffusion import (
@@ -32,6 +37,8 @@ from utils.models import MapperNet, SecretDecoder
 
 class CustomStableDiffusionPipeline(StableDiffusionPipeline):
 
+    vae: AutoencoderKL
+    unet: UNet2DConditionModel
     scheduler: DDIMScheduler
 
     def step_forward(
